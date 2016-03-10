@@ -1,12 +1,13 @@
 CC=gcc
-CFLAGS=-Wall -O0 -ggdb
+CFLAGS=-Wall -O3 -g
 
-.PHONY: all
+all: main
 
-all: wiener main
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $^
 
-wiener: wiener.c
-	$(CC) $(CFLAGS) -c -o $@.o $<
+main: wiener.o main.o
+	$(CC) $(CFLAGS) -o $@ -lssl -lcrypto $^
 
-main: wiener
-	$(CC) $(CFLAGS) -o $@ $@.c -lssl -lcrypto $<.o
+clean:
+	rm -f *.o main 2> /dev/null
