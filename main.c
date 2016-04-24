@@ -6,6 +6,8 @@
 
 BIO *bio_out = NULL;
 
+BIGNUM *temp = NULL, *temp2 = NULL; // Keep a light memory footprint
+
 static void print_BN(const char* varname, BIGNUM *var) {
 	char *repr_bn = NULL;
 
@@ -17,19 +19,231 @@ static void print_BN(const char* varname, BIGNUM *var) {
 	OPENSSL_free(repr_bn);
 }
 
+/*
+ * Compute 'dprime' from 'eprime' and 'n' using Wiener's attack.
+ */
+static int compute_dprime(BIGNUM *n, BIGNUM *eprime, BIGNUM *dprime,
+							BN_CTX *ctx) {
+	int res = EXIT_FAILURE, t = -1;
+
+	cf_t *cf = NULL;
+	bigfraction_t *it = NULL;
+
+	BIGNUM *M = NULL, *C = NULL;
+
+	// Here we maintain the names of variables used in the paper but 'M' may be
+	// renamed.
+	if ((M = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if ((C = BN_CTX_get(ctx)) == NULL)
+		goto err;
+
+	// convert(eprime / n, confrac, 'reduites'):
+	if ((t = BN_num_bits(n)) == -1)
+		goto err;
+	if ((cf = cf_init(ctx, eprime, n)) == NULL)
+		goto err;
+
+	// M := 12345:
+	if (BN_dec2bn(&M, "12345") == 0)
+		goto err;
+
+	// C := M &^ eprime mod n:
+	if (BN_mod_exp(C, M, eprime, n, ctx) == 0)
+		goto err;
+
+	// while C &^ denom(reduites[i]) mod n <> M do i := i+1: od:
+	do {
+		if ((it = cf_next(cf)) == NULL)
+			goto err;
+		if (BN_mod_exp(temp, C, it->k, n, ctx) == 0)
+			goto err;
+	} while (BN_cmp(temp, M) != 0);
+
+	// dprime := denom(reduites[i])
+	if (BN_copy(dprime, it->k) == NULL)
+		goto err;
+
+	res = EXIT_SUCCESS;
+
+err:
+	if (cf != NULL)
+		cf_free(cf);
+
+	return res;
+}
+
+/*
+ * Compute 'b' from 'n', 'eprime' and 'dprime'.
+ */
+static int compute_b(BIGNUM *n, BIGNUM *eprime, BIGNUM *dprime, BIGNUM *b,
+						BN_CTX *ctx) {
+	int res = EXIT_FAILURE;
+
+	BIGNUM	*u = NULL, *quot = NULL, *a = NULL,
+			*b2 = NULL;
+
+	if ((u = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if ((quot = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if ((a = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if ((b2 = BN_CTX_get(ctx)) == NULL)
+		goto err;
+
+	// u := eprime * dprime - 1:
+	if (BN_mul(temp, eprime, dprime, ctx) == 0)
+		goto err;
+	if (BN_sub(u, temp, BN_value_one()) == 0)
+		goto err;
+
+	// while irem(u, 2, 'quot') = 0 do u := quot od:
+	if (BN_add(temp2, BN_value_one(), BN_value_one()) == 0) // temp2 = 2
+		goto err;
+	if (BN_div(quot, temp, u, temp2, ctx) == 0) // quot = u / 2 ; temp = u % 2
+		goto err;
+
+	while (BN_is_zero(temp) == 1) {
+		if (BN_copy(u, quot) == NULL) // u = quot
+			goto err;
+		// quot = u / 2 ; temp = u % 2
+		if (BN_div(quot, temp, u, temp2, ctx) == 0)
+			goto err;
+	}
+
+	/*
+	 * The range is inclusive in the paper but we can only get a number in:
+	 * 0 <= rnd < max with BN_pseudo_rand_range().
+	 */
+	if (BN_copy(temp, n) == NULL) // temp = n
+		goto err;
+	// Note: we could reuse 'temp2' but it is easier this way.
+	if (BN_sub_word(temp, (BN_ULONG) 2) == 0) // temp = n - 2
+		goto err;
+
+	// while igcd(a, n) <> 1 do a := rand(2..n-1)(); od:
+	do {
+		// a := rand(2..n-1)():
+		if (BN_pseudo_rand_range(a, temp) == 0)
+			goto err;
+		if (BN_add_word(a, (BN_ULONG) 2) == 0)
+			goto err;
+		if (BN_gcd(temp2, a, n, ctx) == 0)
+			goto err;
+	} while (BN_is_one(temp2) == 0);
+
+	// b := a &^ u mod n:
+	if (BN_mod_exp(b, a, u, n, ctx) == 0)
+		goto err;
+
+	// b2 := b * b mod n:
+	if (BN_mod_mul(b2, b, b, n, ctx) == 0)
+		goto err;
+
+	/*
+	 * while b2 <> 1 do
+	 * 	b := b2:
+	 * 	b2 := b * b mod n:
+	 * od:
+	 */
+	while (BN_is_one(b2) != 1) {
+		if (BN_copy(b, b2) == NULL)
+			goto err;
+		if (BN_mod_mul(b2, b, b, n, ctx) == 0)
+			goto err;
+	}
+
+	res = EXIT_SUCCESS;
+
+err:
+	return res;
+}
+
+/*
+ * Compute 'p' and 'q' from 'b' and 'n'.
+ */
+static int compute_p1_and_q1(BIGNUM *n, BIGNUM *b, BIGNUM *p1, BIGNUM *q1,
+								BN_CTX *ctx) {
+	int res = EXIT_FAILURE;
+
+	// p1 := igcd(b-1, n);
+	if (BN_sub(temp, b, BN_value_one()) == 0) // temp = b-1
+		goto err;
+	if (BN_gcd(p1, temp, n, ctx) == 0)
+		goto err;
+
+	// q1 := igcd(b+1, n);
+	if (BN_add(temp, b, BN_value_one()) == 0) // temp = b+1
+		goto err;
+	if (BN_gcd(q1, temp, n, ctx) == 0)
+		goto err;
+
+	/*
+	 * If the computation is correct this will never fail.
+	 */
+	// assert(n - p1 * q1 == 0)
+	if (BN_mul(temp, p1, q1, ctx) == 0) // temp = p1 * q1
+		goto err;
+	if (BN_sub(temp2, n, temp) == 0)
+		goto err;
+	if (BN_is_zero(temp2) == 0) {
+		fprintf(stderr, "n - p1 * q1 != 0");
+		goto err;
+	}
+
+	res = EXIT_SUCCESS;
+
+err:
+	return res;
+}
+
+/*
+ * Recover the private exponent 'd' from 'p' and 'q'.
+ */
+static int compute_d2(BIGNUM *p1, BIGNUM *q1, BIGNUM *e, BIGNUM *d2, BN_CTX *ctx) {
+	int res = EXIT_FAILURE;
+
+	BIGNUM *phi1 = NULL;
+
+	if ((phi1 = BN_CTX_get(ctx)) == NULL)
+		goto err;
+
+	// phi1 := (p1-1)*(q1-1):
+	if (BN_sub(temp, p1, BN_value_one()) == 0)
+		goto err;
+	if (BN_sub(temp2, q1, BN_value_one()) == 0)
+		goto err;
+	if (BN_mul(phi1, temp, temp2, ctx) == 0)
+		goto err;
+
+	// igcdex(e, phi1, 'd2')
+	if (BN_gcd(temp, e, phi1, ctx) == 0)
+		goto err;
+	if (BN_is_one(temp) != 1) {
+		fprintf(stderr, "gcd(e, phi1) != 1\n");
+		goto err;
+	}
+	if (BN_mod_inverse(temp, e, phi1, ctx) == NULL)
+		goto err;
+
+	// d2 := d2 mod phi1:
+	if (BN_mod(d2, temp, phi1, ctx) == 0)
+		goto err;
+
+	res = EXIT_SUCCESS;
+
+err:
+	return res;
+}
+
 int main(int argc, char *argv[]) {
-	int ok = EXIT_FAILURE, t = -1;
+	int ok = EXIT_FAILURE;
 
 	BN_CTX *ctx = NULL;
 
 	BIGNUM	*M = NULL, *e = NULL, *eprime = NULL, *n = NULL, *dprime = NULL,
-			*C = NULL, *u = NULL, *quot = NULL, *a = NULL, *b = NULL,
-			*b2 = NULL, *p1 = NULL, *q1 = NULL, *phi1 = NULL, *d2 = NULL,
-			*temp = NULL, *temp2 = NULL;
-	
-
-	cf_t *cf = NULL;
-	bigfraction_t *it = NULL;
+			*b = NULL, *p1 = NULL, *q1 = NULL, *d2 = NULL;
 
 	if (argc != 4) {
 		fprintf(stderr, "usage:\t%s M n e\n\n", argv[0]);
@@ -60,25 +274,13 @@ int main(int argc, char *argv[]) {
 		goto err;
 	if ((n = BN_CTX_get(ctx)) == NULL)
 		goto err;
-	if ((C = BN_CTX_get(ctx)) == NULL)
-		goto err;
 	if ((dprime = BN_CTX_get(ctx)) == NULL)
 		goto err;
-	if ((u = BN_CTX_get(ctx)) == NULL)
-		goto err;
-	if ((quot = BN_CTX_get(ctx)) == NULL)
-		goto err;
-	if ((a = BN_CTX_get(ctx)) == NULL)
-		goto err;
 	if ((b = BN_CTX_get(ctx)) == NULL)
-		goto err;
-	if ((b2 = BN_CTX_get(ctx)) == NULL)
 		goto err;
 	if ((p1 = BN_CTX_get(ctx)) == NULL)
 		goto err;
 	if ((q1 = BN_CTX_get(ctx)) == NULL)
-		goto err;
-	if ((phi1 = BN_CTX_get(ctx)) == NULL)
 		goto err;
 	if ((d2 = BN_CTX_get(ctx)) == NULL)
 		goto err;
@@ -102,173 +304,25 @@ int main(int argc, char *argv[]) {
 	if (BN_sub(eprime, e, M) == 0)
 		goto err;
 
-	print_BN("eprime", eprime);
-
-	// convert(eprime / n, confrac, 'reduites'):
-	if ((t = BN_num_bits(n)) == -1)
-		goto err;
-	if ((cf = cf_init(ctx, eprime, n)) == NULL)
+	if (compute_dprime(n, eprime, dprime, ctx) == EXIT_FAILURE)
 		goto err;
 
-	// M := 12345:
-	if (BN_dec2bn(&M, "12345") == 0)
+	if (compute_b(n, eprime, dprime, b, ctx) == EXIT_FAILURE)
 		goto err;
 
-	print_BN("M", M);
-
-	// C := M &^ eprime mod n:
-	if (BN_mod_exp(C, M, eprime, n, ctx) == 0)
-		goto err;
-
-	print_BN("C", C);
-
-	// while C &^ denom(reduites[i]) mod n <> M do i := i+1: od:
-	do {
-		if ((it = cf_next(cf)) == NULL)
-			goto err;
-		if (BN_mod_exp(temp, C, it->k, n, ctx) == 0)
-			goto err;
-	} while (BN_cmp(temp, M) != 0);
-
-	// dprime := denom(reduites[i])
-	if (BN_copy(dprime, it->k) == NULL)
-		goto err;
-
-	// print(dprime)
-	print_BN("dprime", dprime);
-
-	// u := eprime * dprime - 1:
-	if (BN_mul(temp, eprime, dprime, ctx) == 0)
-		goto err;
-	if (BN_sub(u, temp, BN_value_one()) == 0)
-		goto err;
-
-	// while irem(u, 2, 'quot') = 0 do u := quot od:
-	if (BN_add(temp2, BN_value_one(), BN_value_one()) == 0) // temp2 = 2
-		goto err;
-	if (BN_div(quot, temp, u, temp2, ctx) == 0) // quot = u / 2 ; temp = u % 2
-		goto err;
-
-	while (BN_is_zero(temp) == 1) {
-		if (BN_copy(u, quot) == NULL) // u = quot
-			goto err;
-		if (BN_div(quot, temp, u, temp2, ctx) == 0) // quot = u / 2 ; temp = u % 2
-			goto err;
-	}
-
-	print_BN("u", u);
-
-	/*
-	 * The range is inclusive in the paper but we can only get a number in:
-	 * 0 <= rnd < max with BN_pseudo_rand_range().
-	 */
-	if (BN_copy(temp, n) == NULL) // temp = n
-		goto err;
-	if (BN_sub_word(temp, (BN_ULONG) 2) == 0) // temp = n - 2
-		goto err;
-
-	// while igcd(a, n) <> 1 do a := rand(2..n-1)(); od:
-	do {
-		// a := rand(2..n-1)():
-		if (BN_pseudo_rand_range(a, temp) == 0)
-			goto err;
-		if (BN_add_word(a, (BN_ULONG) 2) == 0)
-			goto err;
-		if (BN_gcd(temp2, a, n, ctx) == 0)
-			goto err;
-	} while (BN_is_one(temp2) == 0);
-
-	print_BN("a", a);
-
-	// b := a &^ u mod n:
-	if (BN_mod_exp(b, a, u, n, ctx) == 0)
-		goto err;
-
-	if (BN_copy(temp, b) == NULL)
-		goto err;
-
-	// b2 := b * b mod n:
-	if (BN_mod_mul(b2, b, temp, n, ctx) == 0)
-		goto err;
-
-	/*
-	 * while b2 <> 1 do
-	 * 	b := b2:
-	 * 	b2 := b * b mod n:
-	 * od:
-	 */
-	while (BN_is_one(b2) != 1) {
-		if (BN_copy(b, b2) == NULL)
-			goto err;
-		if (BN_copy(temp, b) == NULL)
-			goto err;
-		if (BN_mod_mul(b2, b, temp, n, ctx) == 0)
-			goto err;
-	}
-
-	print_BN("b", b);
-	print_BN("b2", b2);
-
-	// p1 := igcd(b-1, n);
-	if (BN_sub(temp, b, BN_value_one()) == 0) // temp = b-1
-		goto err;
-
-	if (BN_gcd(p1, temp, n, ctx) == 0)
+	if (compute_p1_and_q1(n, b, p1, q1, ctx) == EXIT_FAILURE)
 		goto err;
 
 	print_BN("p1", p1);
-
-	// q1 := igcd(b+1, n);
-	if (BN_add(temp, b, BN_value_one()) == 0) // temp = b+1
-		goto err;
-	if (BN_gcd(q1, temp, n, ctx) == 0)
-		goto err;
-
 	print_BN("q1", q1);
 
-	// assert(n - p1 * q1 == 0)
-	if (BN_mul(temp, p1, q1, ctx) == 0) // temp = p1 * q1
-		goto err;
-	if (BN_sub(temp2, n, temp) == 0)
-		goto err;
-	if (BN_is_zero(temp2) == 0) {
-		fprintf(stderr, "n - p1 * q1 != 0");
-		goto err;
-	}
-
-	// phi1 := (p1-1)*(q1-1):
-	if (BN_sub(temp, p1, BN_value_one()) == 0)
-		goto err;
-	if (BN_sub(temp2, q1, BN_value_one()) == 0)
-		goto err;
-	if (BN_mul(phi1, temp, temp2, ctx) == 0)
+	if (compute_d2(p1, q1, e, d2, ctx) == EXIT_FAILURE)
 		goto err;
 
-	print_BN("phi1", phi1);
-
-	// igcdex(e, phi1, 'd2')
-	if (BN_gcd(temp, e, phi1, ctx) == 0)
-		goto err;
-	if (BN_is_one(temp) != 1) {
-		fprintf(stderr, "gcd(e, phi1) != 1\n");
-		goto err;
-	}
-	if (BN_mod_inverse(temp, e, phi1, ctx) == NULL)
-		goto err;
-
-	// d2 := d2 mod phi1:
-	if (BN_mod(d2, temp, phi1, ctx) == 0)
-		goto err;
-
-	// print(d2)
 	print_BN("d2", d2);
-
 	ok = EXIT_SUCCESS;
 
 err:
-	if (cf != NULL)
-		cf_free(cf);
-
 	if (ctx != NULL) {
 		BN_CTX_end(ctx);
 		BN_CTX_free(ctx);
